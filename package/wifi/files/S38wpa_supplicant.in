@@ -40,35 +40,41 @@ WLANAP_IP=${WLANAP_CNET}.1
 
 hostname=$(hostname)
 
-# Determine the wireless mode
-if ! grep -q 'ssid=' $CONFIG >/dev/null; then
-	echo "WiFi network missing" >&2
-	mode="portal"
-elif ! grep -q 'psk=' $CONFIG >/dev/null; then
-	echo "WiFi password missing" >&2
-	mode="portal"
-elif grep -q 'mode=2' $CONFIG >/dev/null; then
-	mode="ap"
-else
-	mode="client"
-fi
+# Determine the wireless mode and mode-dependent settings from $CONFIG.
+# Safe to call repeatedly: credential recovery in start() rewrites $CONFIG,
+# after which this must run again to pick up the new mode.
+determine_mode() {
+	if ! grep -q 'ssid=' $CONFIG >/dev/null; then
+		echo "WiFi network missing" >&2
+		mode="portal"
+	elif ! grep -q 'psk=' $CONFIG >/dev/null; then
+		echo "WiFi password missing" >&2
+		mode="portal"
+	elif grep -q 'mode=2' $CONFIG >/dev/null; then
+		mode="ap"
+	else
+		mode="client"
+	fi
 
-case "$mode" in
-	portal | ap)
-		IFACE="$AP_IFACE"
-		WLAN_INT_FILE="/etc/network/interfaces.d/$STA_IFACE"
-		;;
-	*)
-		IFACE="$STA_IFACE"
-		WLAN_INT_FILE="/etc/network/interfaces.d/$STA_IFACE"
-		;;
-esac
+	case "$mode" in
+		portal | ap)
+			IFACE="$AP_IFACE"
+			WLAN_INT_FILE="/etc/network/interfaces.d/$STA_IFACE"
+			;;
+		*)
+			IFACE="$STA_IFACE"
+			WLAN_INT_FILE="/etc/network/interfaces.d/$STA_IFACE"
+			;;
+	esac
 
-PIDFILE="/run/$DAEMON_SHORT.$IFACE.pid"
-DAEMON_ARGS="-i $IFACE -c $CONFIG -P $PIDFILE -B"
-if [ "true" = "$debug" ]; then
-	DAEMON_ARGS="$DAEMON_ARGS -dd"
-fi
+	PIDFILE="/run/$DAEMON_SHORT.$IFACE.pid"
+	DAEMON_ARGS="-i $IFACE -c $CONFIG -P $PIDFILE -B"
+	if [ "true" = "$debug" ]; then
+		DAEMON_ARGS="$DAEMON_ARGS -dd"
+	fi
+}
+
+determine_mode
 
 credentials_from_card() {
 	local envfile ssid password
@@ -79,6 +85,32 @@ credentials_from_card() {
 	ssid="$(grep '^wlan_ssid=' $envfile | cut -d= -f2-)"
 	password="$(grep '^wlan_pass=' $envfile | cut -d= -f2-)"
 	wlan configure "$ssid" "$password"
+}
+
+# Recover Wi-Fi credentials from the U-Boot environment (wlan_ssid /
+# wlan_pass). This is the fallback path after a full firmware upgrade wipes
+# the overlay: sysupgrade preserves those env keys (see
+# /etc/sysupgrade.preserve-env) and this regenerates wpa_supplicant.conf so
+# the camera rejoins its network instead of dropping to the captive portal.
+# Only acts when the current config has no usable client credentials
+# (mode=portal), so an existing or user-set config always takes precedence.
+credentials_from_uboot_env() {
+	local ssid password ap_mode
+
+	[ "$mode" = "portal" ] || return 0
+	command -v fw_printenv >/dev/null 2>&1 || return 0
+
+	ssid="$(fw_printenv -n wlan_ssid 2>/dev/null)"
+	password="$(fw_printenv -n wlan_pass 2>/dev/null)"
+	ap_mode="$(fw_printenv -n wlan_ap 2>/dev/null)"
+	[ -n "$ssid" ] && [ -n "$password" ] || return 0
+
+	echo "Recovering Wi-Fi credentials from U-Boot environment"
+	if [ "$ap_mode" = "true" ]; then
+		wlan configure "$ssid" "$password" ap
+	else
+		wlan configure "$ssid" "$password"
+	fi
 }
 
 timeout() {
@@ -240,8 +272,13 @@ stop_client() {
 }
 
 start() {
-	# Credential from SD card
+	# Recover Wi-Fi credentials: SD card first (physical override), then
+	# U-Boot env as the post-upgrade fallback. Re-evaluate the mode after
+	# each, since either may rewrite $CONFIG.
 	credentials_from_card
+	determine_mode
+	credentials_from_uboot_env
+	determine_mode
 
 	echo -c 15 "Starting WPA Supplicant"
 

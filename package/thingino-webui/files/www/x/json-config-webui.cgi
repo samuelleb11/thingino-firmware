@@ -161,6 +161,10 @@ handle_post() {
           sed -i "s/^is_default_password=.*/is_default_password=false/" "$session_file"
         fi
       fi
+
+      # Persist provisioning data to U-Boot env so it survives a firmware
+      # upgrade. Output suppressed: CGI stdout becomes the HTTP response.
+      [ -x /usr/sbin/provision-env ] && /usr/sbin/provision-env snapshot >/dev/null 2>&1
     else
       json_error 500 "Password tool missing" "500 Internal Server Error"
     fi

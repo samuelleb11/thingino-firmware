@@ -514,6 +514,10 @@ handle_post() {
 		wlan configure "$wifi_ssid" "$wifi_pass" "$wifi_bssid"
 	fi
 
+	# Persist provisioning data to U-Boot env so it survives a firmware
+	# upgrade. Output suppressed: CGI stdout becomes the HTTP response.
+	[ -x /usr/sbin/provision-env ] && /usr/sbin/provision-env snapshot >/dev/null 2>&1
+
 	emit_json "" '{"status":"ok"}'
 }
 

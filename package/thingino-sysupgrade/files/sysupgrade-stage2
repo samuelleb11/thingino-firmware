@@ -18,6 +18,51 @@ flash_firmware() {
 	flashcp -v $fw_file $mtd_dev
 }
 
+# Write the U-Boot environment partition backed up by stage 1 straight
+# back, byte-for-byte. The full flash just rewrote it with the firmware
+# image's default env; this restores the exact env the camera was
+# running (with its wlan_*, prov_*, ethaddr, ... keys intact).
+#
+# This is a raw partition copy -- no fw_setenv, no CRC computation, no
+# merge. We write back bytes U-Boot already accepted, so it cannot
+# synthesize a broken env or clobber bootcmd/mtdparts/gpio_*.
+#
+# All failure paths are non-fatal -- the upgrade proceeds to reboot.
+restore_env_partition() {
+	local backup="/tmp/sysupgrade/env.backup"
+	local env_mtd="" line
+
+	if [ ! -s "$backup" ]; then
+		echo "No env backup at $backup; nothing to restore."
+		return 0
+	fi
+
+	# Find the env partition in /proc/mtd using shell builtins only
+	# (awk/grep are not on stage 2's PATH). A line looks like:
+	#   mtd1: 00008000 00008000 "env"
+	while IFS= read -r line; do
+		case "$line" in
+			mtd*'"env"')
+				env_mtd="${line%%:*}"
+				break
+				;;
+		esac
+	done </proc/mtd
+	if [ -z "$env_mtd" ]; then
+		echo_c 208 "Env partition not found in /proc/mtd; skipping env restore."
+		return 1
+	fi
+
+	echo_c 112 "\nRestoring U-Boot environment to /dev/$env_mtd"
+	if flashcp -v "$backup" "/dev/$env_mtd"; then
+		echo "U-Boot environment restored byte-for-byte."
+		return 0
+	else
+		echo_c 160 "WARNING: env restore failed; camera will use the firmware default env."
+		return 1
+	fi
+}
+
 stop_streamer() {
 	echo_c 112 "\nStopping streamer in detached stage"
 	if [ -x /etc/init.d/S31raptor ]; then
@@ -83,6 +128,8 @@ detach_and_flash() {
 			x=$((x+1))
 			if flash_firmware; then
 				echo "=== Flash completed successfully at $(date) ==="
+				restore_env_partition || \
+					echo_c 208 "Env restore step failed; continuing to reboot anyway."
 				go_reboot
 				exit 1
 			fi

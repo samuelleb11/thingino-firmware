@@ -43,6 +43,11 @@ Contains the bootloader that initializes the hardware and loads the kernel.
 #### Env Partition (32 KB, fixed)
 Stores U-Boot environment variables in a binary format generated from the `.uenv.txt` configuration files.
 
+A full upgrade (`sysupgrade -f`) rewrites this partition along with the
+rest of the flash. `sysupgrade` backs it up before the flash and writes
+it back afterwards so device settings survive — see
+[provisioning-persistence.md](provisioning-persistence.md).
+
 #### Config Partition (224 KB, fixed)
 A JFFS2 filesystem containing:
 - System configuration files from `user/common/overlay/` and any camera- or device-scoped user overlays

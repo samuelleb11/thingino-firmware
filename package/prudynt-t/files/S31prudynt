@@ -36,6 +36,8 @@ stop_daemon() {
 
 start() {
 	echo -c 15 "Starting Prudynt"
+	# Trim encoder channels to what this SoC's VPU can run before launch.
+	[ -x /usr/sbin/prudynt-vpu-guard ] && /usr/sbin/prudynt-vpu-guard preflight
 	start_daemon
 	status=$?
 	if [ "$status" -eq 0 ]; then

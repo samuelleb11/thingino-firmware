@@ -18,6 +18,22 @@ RUN DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get update && \
     whiptail zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
+# Pin fakeroot to Debian bookworm's 1.31. Trixie's fakeroot 1.37.1.1
+# deadlocks during buildroot's squashfs assembly: the faked daemon never
+# hands its key back, leaving fakeroot blocked in pipe_wait. The bug is in
+# fakeroot's common startup path, so both fakeroot-tcp and fakeroot-sysv
+# are affected. bookworm's 1.31 predates the regression. Held so apt
+# upgrades cannot pull 1.37 back in.
+RUN echo 'deb http://deb.debian.org/debian bookworm main' \
+    > /etc/apt/sources.list.d/bookworm.list && \
+    DEBIAN_FRONTEND=noninteractive apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
+    fakeroot/bookworm libfakeroot/bookworm && \
+    apt-mark hold fakeroot libfakeroot && \
+    rm -f /etc/apt/sources.list.d/bookworm.list && \
+    rm -rf /var/lib/apt/lists/* && \
+    fakeroot --version
+
 # Set vim as default editor
 RUN update-alternatives --install /usr/bin/editor editor /usr/bin/vim 1 && \
     update-alternatives --set editor /usr/bin/vim && \

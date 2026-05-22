@@ -1,153 +1,138 @@
 #!/bin/sh
+# S32prudyntwd - prudynt encoder watchdog
+#
+# Detects a wedged encoder pipeline - the RTSP server is up but stream0's
+# media session was never registered (DESCRIBE ch0 -> 404) because an
+# IMPEncoder::init() failed on this SoC's VPU - and recovers it by:
+#   1. restarting prudynt once (handles transient bring-up races), then
+#   2. progressively dropping the least important encoder channels
+#      (stream3 -> stream2 -> stream1) via prudynt-vpu-guard until the
+#      pipeline comes up, or alerting if only stream0 is left.
+#
+# A plain restart cannot fix a deterministic VPU overcommit, so escalation
+# to channel degradation is the actual self-heal. Live status is published
+# to /run/prudynt-vpu-guard.status for fleet management to consume.
 
-RTSP_URL="rtsp://thingino:thingino@127.0.0.1/ch0"
-PID_FILE="/run/rtsp_watchdog.pid" # PID file to store the background process ID
+PATH=/bin:/sbin:/usr/bin:/usr/sbin${PATH:+:$PATH}
+export PATH
+
+PIDFILE="/run/prudynt-watchdog.pid"
+PRUDYNT_PIDFILE="/run/prudynt.pid"
+PRUDYNT_INIT="/etc/init.d/S31prudynt"
+GUARD="/usr/sbin/prudynt-vpu-guard"
 PORTAL_MODE_FLAG="/run/portal_mode"
+TAG="prudynt-watchdog"
 
-# Interval to check the stream
-INTERVAL=60
+INTERVAL=30          # seconds between checks
+GRACE=90             # seconds to allow encoder bring-up after a (re)start
+FAIL_THRESHOLD=2     # consecutive bad probes before acting
+ALERT_INTERVAL=1800  # slow poll once no channels remain to drop
 
-# Number of retries before declaring the stream down
-RETRY_COUNT=3
+log() {
+	logger -t "$TAG" "$1" 2>/dev/null
+	echo "$TAG: $1"
+}
 
-# Delay in seconds between retry attempts
-RETRY_DELAY=10
-
-# Maximum number of restarts before alerting
-RESTART_LIMIT=3
-
-# Delay in seconds between restarts
-RESTART_DELAY=10
-
-# Seconds to wait for probe command
-CHECK_TIMEOUT=10
-
-RTSP_HOST=""
-RTSP_PORT=""
-PID=""
-RESTART_COUNT=0
-
-is_streamer_disabled() {
+is_disabled() {
 	[ "true" = "$disable_streamer" ] || [ -f "$PORTAL_MODE_FLAG" ]
 }
 
-parse_rtsp_endpoint() {
-	local url="${RTSP_URL#rtsp://}"
-	local creds_trim="${url##*@}"
-	local host_port="${creds_trim%%/*}"
-	if [ -z "$host_port" ]; then
-		return 1
-	fi
-	if echo "$host_port" | grep -q ':'; then
-		RTSP_HOST="${host_port%%:*}"
-		RTSP_PORT="${host_port##*:}"
-	else
-		RTSP_HOST="$host_port"
-		RTSP_PORT=554
-	fi
-	[ -n "$RTSP_HOST" ] && [ -n "$RTSP_PORT" ]
+file_mtime() {
+	stat -c %Y "$1" 2>/dev/null || date -r "$1" +%s 2>/dev/null || echo 0
 }
 
-check_with_curl() {
-	curl -s --max-time "$CHECK_TIMEOUT" --fail -X OPTIONS "$RTSP_URL" >/dev/null 2>&1
+prudynt_running() {
+	[ -f "$PRUDYNT_PIDFILE" ] || return 1
+	pid=$(cat "$PRUDYNT_PIDFILE" 2>/dev/null)
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
-check_with_nc() {
-	[ -n "$RTSP_HOST" ] || parse_rtsp_endpoint || return 1
-	local payload
-	payload=$(printf 'OPTIONS %s RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: stream-watchdog\r\n\r\n' "$RTSP_URL")
-	printf '%s' "$payload" | timeout "$CHECK_TIMEOUT" nc -w "$CHECK_TIMEOUT" "$RTSP_HOST" "$RTSP_PORT" 2>/dev/null | grep -q "RTSP/1.0 200"
+prudynt_age() {
+	# seconds since the prudynt pidfile was (re)created, i.e. since start
+	echo $(( $(date +%s) - $(file_mtime "$PRUDYNT_PIDFILE") ))
 }
 
-check_rtsp_stream() {
-	if check_with_curl; then
-		return 0
-	fi
-
-	if check_with_nc; then
-		return 0
-	fi
-
-	return 1
-}
-
-# Handle signals
-trap 'echo "Stream Watchdog: Stopping watchdog..."; cleanup; exit 0' INT TERM
-
-cleanup() {
-	# Kill any background processes and cleanup resources
-	if [ -f "$PID_FILE" ]; then
-		PID=$(cat "$PID_FILE")
-		[ -n "$PID" ] && kill "$PID" 2>/dev/null || true
-	fi
+remediate_restart() {
+	# remediate_restart <message> <status-state>
+	log "$1"
+	"$GUARD" report "$2" "$1" 2>/dev/null
+	"$PRUDYNT_INIT" restart >/dev/null 2>&1
 }
 
 watch() {
+	fail=0       # consecutive failed probes
+	attempt=0    # remediation attempts in the current wedge episode
+	interval=$INTERVAL
+
 	while true; do
-		SUCCESS=false
+		sleep "$interval"
+		interval=$INTERVAL
 
-		for i in $(seq 1 $RETRY_COUNT); do
-			if check_rtsp_stream; then
-				SUCCESS=true
-				RESTART_COUNT=0 # Reset the restart count after a successful check
-				break
-			else
-				echo "Attempt $i failed. Retrying in $RETRY_DELAY seconds..."
-				sleep $RETRY_DELAY # Delay before retrying
-			fi
-		done
+		is_disabled && continue
+		[ -x "$GUARD" ] || continue
 
-		if ! $SUCCESS; then
-			echo "Stream stream is down, restarting server..."
-			service restart prudynt
-
-			RESTART_COUNT=$((RESTART_COUNT + 1))
-
-			# Delay before checking the stream again after a restart
-			echo "Waiting $RESTART_DELAY seconds before rechecking..."
-			sleep $RESTART_DELAY
-
-			if [ $RESTART_COUNT -ge $RESTART_LIMIT ]; then
-				echo "Restart limit reached, nothing to log..."
-				# ALERT!
-				RESTART_COUNT=0 # Reset the count after escalation
-			fi
+		# prudynt fully dead - S31prudynt has no respawn, so revive it.
+		if ! prudynt_running; then
+			fail=0
+			attempt=$((attempt + 1))
+			remediate_restart "prudynt is not running - starting it" "down"
+			continue
 		fi
 
-		# Sleep for a defined interval before the next full check cycle
-		sleep $INTERVAL
+		# Give the encoder time to come up after any (re)start.
+		[ "$(prudynt_age)" -lt "$GRACE" ] && continue
+
+		if "$GUARD" probe; then
+			if [ "$attempt" -gt 0 ] || [ "$fail" -gt 0 ]; then
+				log "stream0 healthy again ($("$GUARD" active) channel(s) active)"
+			fi
+			fail=0
+			attempt=0
+			"$GUARD" report healthy "stream0 RTSP session registered" 2>/dev/null
+			continue
+		fi
+
+		# Probe failed - confirm it is not a one-off blip.
+		fail=$((fail + 1))
+		[ "$fail" -lt "$FAIL_THRESHOLD" ] && continue
+		fail=0
+		attempt=$((attempt + 1))
+
+		# First attempt: a plain restart clears transient bring-up races.
+		if [ "$attempt" -le 1 ]; then
+			remediate_restart "stream0 wedged - restarting prudynt" "wedged"
+			continue
+		fi
+
+		# Persistent wedge: drop a channel and restart.
+		dropped=$("$GUARD" degrade)
+		if [ -n "$dropped" ]; then
+			remediate_restart "stream0 still wedged - dropped $dropped, restarting" "wedged"
+		else
+			log "stream0 wedged and no channels left to drop - manual attention needed"
+			"$GUARD" report alert "encoder wedged with only stream0 configured" 2>/dev/null
+			"$PRUDYNT_INIT" restart >/dev/null 2>&1
+			interval=$ALERT_INTERVAL
+		fi
 	done
 }
 
 start() {
-	echo -c 15 "Starting Stream Watchdog"
-
-	if is_streamer_disabled; then
-		echo "Streamer disabled" >&2
-		exit 1
+	echo -c 15 "Starting Prudynt Watchdog"
+	if is_disabled; then
+		echo "Streamer disabled, watchdog not started"
+		exit 0
 	fi
-
-	parse_rtsp_endpoint || true
-
 	watch &
-	PID=$!
-	echo "$PID" >"$PID_FILE" # Store the PID of the background process
+	echo $! > "$PIDFILE"
 }
 
 stop() {
-	echo -c 15 "Stopping Stream Watchdog"
-
-	if [ -f "$PID_FILE" ]; then
-		PID=$(cat "$PID_FILE")
-		if kill -0 "$PID" 2>/dev/null; then
-			kill "$PID"
-			echo "Watchdog process stopped."
-			rm -f "$PID_FILE" # Clean up the PID file
-		else
-			echo "No running watchdog process found."
-		fi
-	else
-		echo "PID file not found."
+	echo -c 15 "Stopping Prudynt Watchdog"
+	if [ -f "$PIDFILE" ]; then
+		pid=$(cat "$PIDFILE" 2>/dev/null)
+		[ -n "$pid" ] && kill "$pid" 2>/dev/null
+		rm -f "$PIDFILE"
 	fi
 }
 

@@ -285,6 +285,44 @@ flush_memory() {
 	echo 3 >/proc/sys/vm/drop_caches
 }
 
+# Back up the U-Boot environment partition byte-for-byte to
+# $workdir/env.backup. Stage 2 writes it straight back after the flash
+# so the environment (and every key in it: wlan_*, prov_*, ethaddr, ...)
+# survives a full upgrade that would otherwise rewrite it.
+#
+# This deliberately avoids fw_printenv/fw_setenv: post-flash those tools
+# mis-read the env as "Bad CRC" (a fw-tools geometry/format quirk),
+# even though U-Boot itself reads it fine. A raw partition copy sidesteps
+# that entirely -- we restore the exact bytes the camera was running.
+backup_env_partition() {
+	local env_mtd env_dev size
+
+	env_mtd=$(awk -F: '/"env"/{print $1}' /proc/mtd 2>/dev/null | head -1)
+	if [ -z "$env_mtd" ]; then
+		echo "No env partition in /proc/mtd; skipping env backup."
+		return 0
+	fi
+	env_dev="/dev/$env_mtd"
+	if [ ! -r "$env_dev" ]; then
+		echo "$env_dev not readable; skipping env backup."
+		return 0
+	fi
+
+	echo_c 112 "\nBacking up U-Boot environment from $env_dev"
+	cat "$env_dev" >"$workdir/env.backup" 2>/dev/null
+	size=$(wc -c <"$workdir/env.backup" 2>/dev/null)
+
+	# The env partition is small and fixed; a sane backup is 4K-256K.
+	# Anything outside that is suspect -- discard it so stage 2 skips
+	# the restore rather than writing garbage to the env.
+	if [ -z "$size" ] || [ "$size" -lt 4096 ] || [ "$size" -gt 262144 ]; then
+		echo_c 208 "Env backup size looks wrong ($size bytes); discarding it."
+		rm -f "$workdir/env.backup"
+		return 0
+	fi
+	echo "Saved $size bytes of U-Boot environment to $workdir/env.backup"
+}
+
 show_help() {
 	echo -e "Usage: $0 [-x] [-f|-p|<file>|<URL>]
 Where:
@@ -511,6 +549,12 @@ echo_c 112 "\nPrepare working directory"
 clone_app /bin/busybox
 clone_app /sbin/$stage2app
 for a in $bbapplets; do expand_bb $a; done
+
+# Full-upgrade only: a full ("all") flash rewrites the env partition,
+# so back it up now -- stage 2 writes it straight back after the flash.
+if [ "$mtd_dev" = "$(full_upgrade_partition_name)" ]; then
+	backup_env_partition
+fi
 
 echo_c 112 "\nPartitions"
 cat /proc/mtd

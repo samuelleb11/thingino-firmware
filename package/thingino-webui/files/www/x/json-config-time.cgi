@@ -182,6 +182,11 @@ handle_post() {
 			fi
 
 			write_config
+
+			# Persist provisioning data to U-Boot env so it survives a
+			# firmware upgrade. Output suppressed: CGI stdout is the response.
+			[ -x /usr/sbin/provision-env ] && /usr/sbin/provision-env snapshot >/dev/null 2>&1
+
 			send_json '{"status":"ok","message":"Time configuration updated"}'
 			;;
 

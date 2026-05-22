@@ -1,0 +1,130 @@
+#!/bin/sh
+# provision-env - sync Thingino provisioning data between the overlay
+# (/etc) and the U-Boot environment, so a full firmware upgrade (which
+# wipes the overlay partition) can restore the device's identity.
+#
+#   provision-env snapshot   overlay -> U-Boot env. Called after the
+#                            captive portal or the web UI changes a
+#                            provisioned setting.
+#   provision-env restore    U-Boot env -> overlay. Called once, on the
+#                            first boot after an overlay wipe, by the
+#                            S02provision init script.
+#
+# Secrets are stored as hashes, never plaintext: the root password as
+# its /etc/shadow crypt hash, Wi-Fi as the derived PSK. The hash and the
+# SSH key are base64-wrapped so awkward characters never reach fw_setenv.
+#
+# Env keys written/read:
+#   prov_hostname  prov_timezone  prov_tzdata  prov_rootpw  prov_sshkey
+#   wlan_ssid      wlan_pass      wlan_ap
+# (wlan_* are also consumed by S38wpa_supplicant for the Wi-Fi restore.)
+
+MARKER="/etc/.provisioned"
+WPA_CONF="/etc/wpa_supplicant.conf"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+snapshot() {
+	have fw_setenv || { echo "provision-env: fw_setenv unavailable" >&2; return 1; }
+
+	hostname_val=""
+	[ -r /etc/hostname ] && hostname_val=$(cat /etc/hostname)
+
+	tz_name=""
+	[ -r /etc/timezone ] && tz_name=$(cat /etc/timezone)
+	tz_data=""
+	[ -r /etc/TZ ] && tz_data=$(cat /etc/TZ)
+
+	# Root password: the crypt hash from /etc/shadow, base64-wrapped.
+	rootpw_b64=""
+	if [ -r /etc/shadow ]; then
+		h=$(awk -F: '$1=="root"{print $2}' /etc/shadow)
+		[ -n "$h" ] && rootpw_b64=$(printf '%s' "$h" | base64 | tr -d '\n')
+	fi
+
+	# SSH authorized_keys, base64-wrapped (may be multi-line).
+	sshkey_b64=""
+	[ -r /root/.ssh/authorized_keys ] && \
+		sshkey_b64=$(base64 < /root/.ssh/authorized_keys | tr -d '\n')
+
+	# Wi-Fi: SSID, derived PSK and AP-mode flag from wpa_supplicant.conf.
+	wlan_ssid_val=""
+	wlan_pass_val=""
+	wlan_ap_val=""
+	if [ -r "$WPA_CONF" ]; then
+		wlan_ssid_val=$(sed -n 's/^[[:space:]]*ssid="\(.*\)"[[:space:]]*$/\1/p' "$WPA_CONF" | head -1)
+		wlan_pass_val=$(sed -n 's/^[[:space:]]*psk=\([0-9a-fA-F]*\)[[:space:]]*$/\1/p' "$WPA_CONF" | head -1)
+		grep -q '^[[:space:]]*mode=2' "$WPA_CONF" && wlan_ap_val="true"
+	fi
+
+	# Apply every key in a single batched fw_setenv (one flash write).
+	# A line with an empty value deletes that key from the environment.
+	tmp=$(mktemp) || return 1
+	{
+		printf 'prov_hostname %s\n' "$hostname_val"
+		printf 'prov_timezone %s\n' "$tz_name"
+		printf 'prov_tzdata %s\n'   "$tz_data"
+		printf 'prov_rootpw %s\n'   "$rootpw_b64"
+		printf 'prov_sshkey %s\n'   "$sshkey_b64"
+		printf 'wlan_ssid %s\n'     "$wlan_ssid_val"
+		printf 'wlan_pass %s\n'     "$wlan_pass_val"
+		printf 'wlan_ap %s\n'       "$wlan_ap_val"
+	} >"$tmp"
+	fw_setenv --script "$tmp"
+	rc=$?
+	rm -f "$tmp"
+	# Diagnostics go to stderr only: this tool is invoked from CGIs whose
+	# stdout IS the HTTP response, so anything on stdout corrupts it.
+	[ "$rc" -eq 0 ] && echo "provision-env: snapshot complete" >&2
+	return "$rc"
+}
+
+restore() {
+	[ -f "$MARKER" ] && return 0          # overlay already settled
+	have fw_printenv || return 0
+
+	hostname_val=$(fw_printenv -n prov_hostname 2>/dev/null)
+	tz_name=$(fw_printenv -n prov_timezone 2>/dev/null)
+	tz_data=$(fw_printenv -n prov_tzdata 2>/dev/null)
+	rootpw_b64=$(fw_printenv -n prov_rootpw 2>/dev/null)
+	sshkey_b64=$(fw_printenv -n prov_sshkey 2>/dev/null)
+
+	if [ -n "$hostname_val" ]; then
+		echo "$hostname_val" >/etc/hostname
+		hostname "$hostname_val"
+		echo "provision-env: restored hostname" >&2
+	fi
+
+	if [ -n "$tz_name" ]; then
+		echo "$tz_name" >/etc/timezone
+		echo "provision-env: restored timezone" >&2
+	fi
+	[ -n "$tz_data" ] && echo "$tz_data" >/etc/TZ
+
+	if [ -n "$rootpw_b64" ] && have chpasswd; then
+		h=$(printf '%s' "$rootpw_b64" | base64 -d 2>/dev/null)
+		if [ -n "$h" ] && printf 'root:%s\n' "$h" | chpasswd -e; then
+			echo "provision-env: restored root password" >&2
+		fi
+	fi
+
+	if [ -n "$sshkey_b64" ]; then
+		mkdir -p /root/.ssh
+		chmod 700 /root/.ssh
+		printf '%s' "$sshkey_b64" | base64 -d 2>/dev/null >/root/.ssh/authorized_keys
+		chmod 600 /root/.ssh/authorized_keys
+		echo "provision-env: restored SSH authorized_keys" >&2
+	fi
+
+	# Wi-Fi (wlan_ssid/wlan_pass/wlan_ap) is restored separately by
+	# S38wpa_supplicant, which integrates with wpa_supplicant startup.
+
+	touch "$MARKER"
+	return 0
+}
+
+case "$1" in
+	snapshot) snapshot ;;
+	restore)  restore ;;
+	*) echo "Usage: $0 {snapshot|restore}" >&2; exit 1 ;;
+esac

@@ -307,6 +307,8 @@ define PRUDYNT_T_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/usr/sbin/timelapse
 	$(INSTALL) -D -m 0755 $(PRUDYNT_T_PKGDIR)/files/daynight \
 		$(TARGET_DIR)/usr/sbin/daynight
+	$(INSTALL) -D -m 0755 $(PRUDYNT_T_PKGDIR)/files/prudynt-vpu-guard \
+		$(TARGET_DIR)/usr/sbin/prudynt-vpu-guard
 	$(INSTALL) -D -m 0755 $(PRUDYNT_T_PKGDIR)/files/metrics \
 		$(TARGET_DIR)/var/www/x/metrics
 
@@ -351,8 +353,8 @@ define PRUDYNT_T_INSTALL_TARGET_CMDS
 	# services
 	$(INSTALL) -D -m 0755 $(PRUDYNT_T_PKGDIR)/files/S31prudynt \
 		$(TARGET_DIR)/etc/init.d/S31prudynt
-#	$(INSTALL) -D -m 0755 $(PRUDYNT_T_PKGDIR)/files/S32prudyntwd \
-#		$(TARGET_DIR)/etc/init.d/S32prudyntwd
+	$(INSTALL) -D -m 0755 $(PRUDYNT_T_PKGDIR)/files/S32prudyntwd \
+		$(TARGET_DIR)/etc/init.d/S32prudyntwd
 	if [ "$(BR2_PACKAGE_THINGINO_ONVIF)" = "y" ]; then \
 		$(INSTALL) -D -m 0755 $(PRUDYNT_T_PKGDIR)/files/S96onvif_discovery \
 			$(TARGET_DIR)/etc/init.d/S96onvif_discovery; \

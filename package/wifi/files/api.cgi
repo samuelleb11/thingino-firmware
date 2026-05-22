@@ -207,6 +207,11 @@ save_config() {
 	# Update interface for onvif
 	jct /etc/onvif.json set ifs wlan0
 
+	# Persist provisioning data to U-Boot env so it survives a firmware
+	# upgrade. Output is fully suppressed: this runs inside the CGI whose
+	# stdout becomes the HTTP response body.
+	[ -x /usr/sbin/provision-env ] && /usr/sbin/provision-env snapshot >/dev/null 2>&1
+
 	# Success response
 	cat <<-EOF
 		{

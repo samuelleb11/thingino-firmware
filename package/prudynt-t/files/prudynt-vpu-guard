@@ -1,0 +1,269 @@
+#!/bin/sh
+# prudynt-vpu-guard - keep prudynt's encoder channel count within what the
+# SoC VPU can actually run, and provide recovery primitives for the prudynt
+# watchdog (S32prudyntwd).
+#
+# Why this exists:
+#   prudynt's default /etc/prudynt.json enables four IMP encoder channels:
+#     stream0  H264 main  (RTSP ch0)  - essential
+#     stream1  H264 sub   (RTSP ch1)  - important
+#     stream2  JPEG main  (snapshot)  - useful
+#     stream3  JPEG sub   (snapshot)  - least important
+#   Budget SoCs such as the T23 cannot run four channels. The 4th
+#   IMPEncoder::init() fails ("vpu channel run failed"), which wedges the
+#   whole encoder: stream0 never emits SPS/PPS, RTSP DESCRIBE on ch0 returns
+#   404, and prudynt spins forever retrying the IDR.
+#
+#   This tool (a) trims the channel count to a SoC-safe maximum before
+#   prudynt starts (preflight), and (b) gives the watchdog primitives to
+#   probe the pipeline and drop further channels if it is still wedged.
+#
+# Usage: prudynt-vpu-guard {preflight|probe|degrade|reset|status|max|active|
+#                           report <state> <message>}
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin${PATH:+:$PATH}
+export PATH
+
+CFG="/etc/prudynt.json"
+JCT="/usr/bin/jct"
+STATUS_FILE="/run/prudynt-vpu-guard.status"
+LOCKDIR="/run/prudynt-vpu-guard.lock"
+TAG="prudynt-vpu-guard"
+
+# Streams that may be dropped, ordered least-important first.
+# stream0 (RTSP ch0) is essential and is never auto-disabled.
+DEGRADE_ORDER="stream3 stream2 stream1"
+ALL_STREAMS="stream0 stream1 stream2 stream3"
+
+log() {
+	logger -t "$TAG" "$1" 2>/dev/null
+	echo "$TAG: $1" >&2
+}
+
+file_mtime() {
+	stat -c %Y "$1" 2>/dev/null || date -r "$1" +%s 2>/dev/null || echo 0
+}
+
+# ------------------------------------------------------------------- locking
+lock_acquire() {
+	i=0
+	while ! mkdir "$LOCKDIR" 2>/dev/null; do
+		# Break a stale lock left behind by a killed holder.
+		age=$(( $(date +%s) - $(file_mtime "$LOCKDIR") ))
+		[ "$age" -gt 20 ] && rmdir "$LOCKDIR" 2>/dev/null
+		i=$((i + 1))
+		[ "$i" -ge 30 ] && return 1
+		sleep 1
+	done
+	return 0
+}
+
+lock_release() {
+	rmdir "$LOCKDIR" 2>/dev/null
+}
+
+# --------------------------------------------------------------- config I/O
+cfg_get() {
+	# cfg_get <dotted.path> -> bare value (quotes/whitespace stripped)
+	[ -x "$JCT" ] && [ -f "$CFG" ] || return 1
+	"$JCT" "$CFG" get "$1" 2>/dev/null | tr -d '"\r\n' | sed 's/^ *//;s/ *$//'
+}
+
+cfg_is_true() {
+	[ "$(cfg_get "$1")" = "true" ]
+}
+
+cfg_import() {
+	# cfg_import <json-fragment> -> deep-merge fragment into $CFG
+	[ -x "$JCT" ] && [ -f "$CFG" ] || return 1
+	tmp="/tmp/.vpu-guard.$$.json"
+	printf '%s\n' "$1" > "$tmp" || return 1
+	rc=0
+	if lock_acquire; then
+		"$JCT" "$CFG" import "$tmp" >/dev/null 2>&1 || rc=1
+		lock_release
+	else
+		log "could not acquire config lock"
+		rc=1
+	fi
+	rm -f "$tmp"
+	return $rc
+}
+
+stream_enabled() {
+	cfg_is_true "$1.enabled"
+}
+
+set_stream() {
+	# set_stream <streamN> <true|false>
+	cfg_import "{\"$1\":{\"enabled\":$2}}"
+}
+
+count_active() {
+	n=0
+	for s in $ALL_STREAMS; do
+		stream_enabled "$s" && n=$((n + 1))
+	done
+	echo "$n"
+}
+
+disabled_list() {
+	out=""
+	for s in $ALL_STREAMS; do
+		stream_enabled "$s" || out="$out${out:+,}$s"
+	done
+	echo "$out"
+}
+
+# --------------------------------------------------------------- SoC policy
+soc_family() {
+	soc -f 2>/dev/null
+}
+
+soc_max_channels() {
+	# Maximum encoder channels each SoC family can run reliably.
+	# Unlisted families default to 4 (prudynt's default). Extend this
+	# table as field evidence accumulates - t10/t20/t21 are also budget
+	# parts and may need a lower cap.
+	case "$(soc_family)" in
+		t23) echo 3 ;;
+		*)   echo 4 ;;
+	esac
+}
+
+guard_active() {
+	# The guard is skipped for multi-sensor rigs (they intentionally drive
+	# extra channels and switch sensors) and when explicitly disabled via
+	#   "vpu_guard": { "enabled": false }
+	# in a camera/user prudynt.json override.
+	cfg_is_true "multi_sensor.enabled" && return 1
+	[ "$(cfg_get vpu_guard.enabled)" = "false" ] && return 1
+	return 0
+}
+
+# -------------------------------------------------------------------- status
+write_status() {
+	# write_status <state> <message>
+	mc=$(soc_max_channels)
+	ac=$(count_active)
+	dl=$(disabled_list)
+	ts=$(date +%s 2>/dev/null)
+	hr=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+	cat > "$STATUS_FILE" <<EOF
+{
+  "state": "$1",
+  "soc": "$(soc_family)",
+  "max_channels": $mc,
+  "active_channels": $ac,
+  "disabled_streams": "$dl",
+  "updated": ${ts:-0},
+  "updated_iso": "$hr",
+  "message": "$2"
+}
+EOF
+}
+
+# ----------------------------------------------------------------- preflight
+do_preflight() {
+	if [ ! -x "$JCT" ] || [ ! -f "$CFG" ]; then
+		log "preflight skipped: jct or $CFG missing"
+		return 0
+	fi
+	if ! guard_active; then
+		log "preflight skipped: guard disabled (multi-sensor or opt-out)"
+		write_status "disabled" "vpu guard disabled for this camera"
+		return 0
+	fi
+
+	max=$(soc_max_channels)
+	active=$(count_active)
+	if [ "$active" -le "$max" ]; then
+		log "preflight: $active encoder channel(s), within SoC limit ($max)"
+		write_status "configured" "preflight ok - $active of $max channels"
+		return 0
+	fi
+
+	log "preflight: $active channels exceed SoC limit ($max) - trimming"
+	for s in $DEGRADE_ORDER; do
+		[ "$active" -le "$max" ] && break
+		if stream_enabled "$s"; then
+			if set_stream "$s" false; then
+				active=$((active - 1))
+				log "preflight: disabled $s to fit the SoC VPU limit"
+			fi
+		fi
+	done
+	write_status "configured" "preflight trimmed to $(count_active) of $max channels"
+	return 0
+}
+
+# ------------------------------------------------------------------- degrade
+do_degrade() {
+	# Disable the next-least-important enabled channel. Prints the stream
+	# name and exits 0 on success; exits 1 when nothing can be dropped.
+	if ! guard_active; then
+		log "degrade refused: guard disabled for this camera"
+		return 1
+	fi
+	for s in $DEGRADE_ORDER; do
+		if stream_enabled "$s"; then
+			if set_stream "$s" false; then
+				log "degrade: disabled $s (encoder still wedged)"
+				echo "$s"
+				return 0
+			fi
+			return 1
+		fi
+	done
+	log "degrade: no further channels can be dropped (only stream0 left)"
+	return 1
+}
+
+# --------------------------------------------------------------------- reset
+do_reset() {
+	# Undo any watchdog degradation, then re-apply the SoC baseline.
+	for s in stream1 stream2 stream3; do
+		set_stream "$s" true
+	done
+	log "reset: re-enabled stream1/2/3, re-applying SoC baseline"
+	do_preflight
+}
+
+# --------------------------------------------------------------------- probe
+do_probe() {
+	# Probe RTSP ch0 with a DESCRIBE. A registered media session answers
+	# 200 (or 401 when auth is required); a wedged encoder never registers
+	# the session, so live555 answers 404.
+	#   exit 0 - healthy   exit 1 - wedged   exit 2 - RTSP server down
+	host="127.0.0.1"
+	port=$(cfg_get rtsp.port); [ -n "$port" ] || port=554
+	ep=$(cfg_get stream0.rtsp_endpoint); [ -n "$ep" ] || ep="ch0"
+	url="rtsp://$host:$port/$ep"
+
+	req=$(printf 'DESCRIBE %s RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n' "$url")
+	resp=$(printf '%s' "$req" | timeout 8 nc -w 3 "$host" "$port" 2>/dev/null)
+
+	[ -z "$resp" ] && return 2
+	status=$(printf '%s' "$resp" | head -n1)
+	case "$status" in
+		*" 200 "*|*" 401 "*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# ------------------------------------------------------------------ dispatch
+case "$1" in
+	preflight) do_preflight ;;
+	probe)     do_probe; exit $? ;;
+	degrade)   do_degrade; exit $? ;;
+	reset)     do_reset ;;
+	report)    write_status "$2" "$3" ;;
+	status)    [ -f "$STATUS_FILE" ] && cat "$STATUS_FILE" || echo '{"state":"unknown"}' ;;
+	max)       soc_max_channels ;;
+	active)    count_active ;;
+	*)
+		echo "Usage: $0 {preflight|probe|degrade|reset|report <state> <msg>|status|max|active}" >&2
+		exit 1
+		;;
+esac
+exit 0
