@@ -1,4 +1,23 @@
 #!/bin/sh
+# S59motor - motor (PTZ) init script.
+#
+# Actions:
+#   start       load the motor module + daemon, home and position (boot).
+#   stop        stop daemon, unload the module (shutdown).
+#   restart     stop + start.
+#   reload      apply a changed motors.json that needs new module
+#               parameters (e.g. direction reversal): reloads the motor
+#               kernel module in place. The camera keeps streaming and
+#               only the motors pause (~10s), so a motor config change no
+#               longer needs a full system reboot.
+#   reposition  apply a changed home position (motors.pos_0) only -- a
+#               plain absolute move, no module reload, no reboot.
+#
+# reload exit codes, so a caller reboots only when it is truly required:
+#   0  new parameters applied.
+#   3  motor module could not be unloaded (busy); parameters NOT applied
+#      -- motors keep running on the previous config, and a full reboot
+#      is required to apply the change.
 
 DAEMON="/usr/bin/motors-daemon"
 DAEMON_ARGS="-d -p"
@@ -166,6 +185,64 @@ stop() {
 	fi
 }
 
+# Stop the daemon and wait for it to release the motor device, so the
+# rmmod that follows is not refused for a busy module.
+graceful_daemon_stop() {
+	stop_daemon
+	i=0
+	while pidof motors-daemon >/dev/null 2>&1; do
+		[ "$i" -ge 5 ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+	# Last resort: a daemon that ignored SIGTERM still pins the module.
+	pidof motors-daemon >/dev/null 2>&1 && killall -9 motors-daemon 2>/dev/null
+}
+
+# Unload the motor module, retrying while it is still busy. Returns 0
+# once the module is gone, 1 if it could not be unloaded.
+unload_module_retry() {
+	i=0
+	while [ "$i" -lt 5 ]; do
+		grep -qE "^motor " /proc/modules || return 0
+		rmmod motor 2>/dev/null && return 0
+		echo "motor module busy, retrying unload..." >&2
+		sleep 1
+		i=$((i + 1))
+	done
+	grep -qE "^motor " /proc/modules && return 1
+	return 0
+}
+
+# Apply a motors.json change that needs new module parameters (e.g. a
+# direction reversal) by reloading the motor module in place instead of
+# rebooting the camera.
+reload() {
+	echo -c 15 "Reloading motor module"
+	graceful_daemon_stop
+	if unload_module_retry; then
+		start
+		return 0
+	fi
+	# Module still loaded with the previous parameters: the motors stay
+	# usable on the old config, but the new one needs a reboot to apply.
+	echo "motor module could not be unloaded; new parameters NOT applied." >&2
+	echo "A full reboot is required to apply this motor configuration." >&2
+	start
+	return 3
+}
+
+# Apply a changed home position only (motors.pos_0): a plain absolute
+# move, no module reload, no reboot.
+reposition() {
+	echo -c 15 "Repositioning motors to configured home"
+	steps_pan=$(jct $MOTORS_CONFIG get motors.steps_pan)
+	steps_tilt=$(jct $MOTORS_CONFIG get motors.steps_tilt)
+	[ -z "$steps_pan" ] && steps_pan=4000
+	[ -z "$steps_tilt" ] && steps_tilt=2000
+	position_motors
+}
+
 case "$1" in
 	start)
 		start
@@ -178,8 +255,16 @@ case "$1" in
 		sleep 1
 		start
 		;;
+	reload)
+		reload
+		exit $?
+		;;
+	reposition)
+		reposition
+		exit $?
+		;;
 	*)
-		echo "Usage: $0 {start|stop|restart}"
+		echo "Usage: $0 {start|stop|restart|reload|reposition}"
 		exit 1
 		;;
 esac

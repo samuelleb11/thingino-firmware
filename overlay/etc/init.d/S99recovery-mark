@@ -1,0 +1,36 @@
+#!/bin/sh
+# S99recovery-mark - mark this boot "good" once it has stayed up long enough,
+# so the boot-loop failsafe (recovery-guard) stops counting it as a failure.
+#
+# A boot that the hardware watchdog is going to kill does so within ~1-2 min;
+# surviving past recovery_settle_time (default 180s) means the boot is sound.
+
+SETTLE=$(fw_printenv -n recovery_settle_time 2>/dev/null)
+case "$SETTLE" in
+	'' | *[!0-9]*) SETTLE=180 ;;
+esac
+
+start() {
+	[ -x /usr/sbin/recovery-guard ] || exit 0
+	# Background a delayed mark-good; if the camera reboots before SETTLE
+	# elapses, the counter is left incremented and the failsafe can act.
+	(
+		sleep "$SETTLE"
+		/usr/sbin/recovery-guard mark-good
+	) &
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop | restart)
+		true
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}" >&2
+		exit 1
+		;;
+esac
+
+exit 0

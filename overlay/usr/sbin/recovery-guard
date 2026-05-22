@@ -1,0 +1,152 @@
+#!/bin/sh
+# recovery-guard - boot-loop failsafe for the hardware watchdog.
+#
+# Why this exists:
+#   On a remotely-provisioned fleet, a camera must never get into a state
+#   that needs a physical power-cycle. The hardware watchdog can do exactly
+#   that: if a boot stalls or wedges, the watchdog resets the SoC - and if
+#   that reset lands the camera right back in the same broken state, it
+#   loops forever. Someone then has to walk up and pull power.
+#
+# How it works:
+#   A persistent boot counter in the U-Boot environment is incremented on
+#   every boot (by K99watchdog, before it arms the watchdog) and cleared
+#   once a boot has stayed up long enough to be "proven good" (by
+#   S99recovery-mark). If too many boots fail in a row, the camera enters
+#   sticky RECOVERY MODE:
+#     - the hardware watchdog is NOT armed (the loop stops),
+#     - heavy services are skipped (lightest possible system - see rcS),
+#     - the camera parks itself booted, on the network and reachable over
+#       SSH, until an operator clears it remotely.
+#
+# State - U-Boot environment:
+#   recovery_bootcount       consecutive not-yet-good boots
+#   recovery_mode            "1" while sticky recovery mode is active
+#   recovery_boot_threshold  bad boots before recovery trips (default 3)
+#   recovery_skip_services   space-separated init scripts to skip in
+#                            recovery mode (default: the built-in list)
+# State - runtime (tmpfs, recreated each boot):
+#   /run/recovery_mode             present when this boot is in recovery
+#   /run/recovery-guard.counted    this boot has already been counted
+#
+# Usage: recovery-guard {arm-check|mark-good|resume|skip-list|active|status}
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin${PATH:+:$PATH}
+export PATH
+
+FLAG=/run/recovery_mode
+COUNTED=/run/recovery-guard.counted
+TAG=recovery-guard
+
+# Heavy / non-essential services skipped while in recovery mode. The system,
+# network, wifi, SSH, mdev, kernel modules and the web UI are deliberately
+# NOT listed, so a recovered camera always comes up reachable and manageable.
+# Extend per-fork with the U-Boot env var recovery_skip_services.
+DEFAULT_SKIP="S31prudynt S32prudyntwd S96onvif_discovery S98recorder S99heartbeat"
+
+log() {
+	logger -t "$TAG" "$1" 2>/dev/null
+	echo "$TAG: $1"
+}
+
+env_get() {
+	fw_printenv -n "$1" 2>/dev/null
+}
+
+threshold() {
+	t=$(env_get recovery_boot_threshold)
+	case "$t" in
+		'' | *[!0-9]*) echo 3 ;;
+		*) echo "$t" ;;
+	esac
+}
+
+sanitize_count() {
+	# echo a clean non-negative integer for the given raw value
+	case "$1" in
+		'' | *[!0-9]*) echo 0 ;;
+		*) echo "$1" ;;
+	esac
+}
+
+print_skip_list() {
+	# init scripts rcS should skip while in recovery mode
+	s=$(env_get recovery_skip_services)
+	[ -n "$s" ] && echo "$s" || echo "$DEFAULT_SKIP"
+}
+
+case "$1" in
+	arm-check)
+		# Called by K99watchdog. Exit 0 = safe to arm the hardware
+		# watchdog; exit 1 = recovery mode, do NOT arm it.
+
+		# Sticky recovery already active - stay in it.
+		if [ "$(env_get recovery_mode)" = "1" ]; then
+			: > "$FLAG"
+			log "recovery mode is active (sticky) - hardware watchdog NOT armed; clear with 'recovery-guard resume'"
+			exit 1
+		fi
+
+		# Count this boot exactly once (a runtime K99watchdog restart
+		# must not inflate the counter).
+		count=$(sanitize_count "$(env_get recovery_bootcount)")
+		if [ ! -f "$COUNTED" ]; then
+			: > "$COUNTED"
+			count=$((count + 1))
+			fw_setenv recovery_bootcount "$count" 2>/dev/null
+		fi
+
+		max=$(threshold)
+		if [ "$count" -ge "$max" ]; then
+			fw_setenv recovery_mode 1 2>/dev/null
+			: > "$FLAG"
+			log "BOOT LOOP DETECTED ($count consecutive bad boots, limit $max) - entering recovery mode, hardware watchdog NOT armed"
+			exit 1
+		fi
+
+		log "boot attempt $count of $max - hardware watchdog will be armed"
+		exit 0
+		;;
+
+	mark-good)
+		# Called once the system has stayed up long enough that this boot
+		# counts as successful. Resets the consecutive-bad-boot counter.
+		if [ "$(env_get recovery_bootcount)" != "0" ]; then
+			fw_setenv recovery_bootcount 0 2>/dev/null
+			log "boot proven good - boot counter reset to 0"
+		fi
+		;;
+
+	resume)
+		# Operator command (local or remote): leave recovery mode. The
+		# hardware watchdog will be armed again on the next boot.
+		fw_setenv recovery_mode 0 2>/dev/null
+		fw_setenv recovery_bootcount 0 2>/dev/null
+		rm -f "$FLAG"
+		log "recovery mode cleared - normal operation resumes on next boot"
+		;;
+
+	skip-list)
+		print_skip_list
+		;;
+
+	active)
+		# Exit 0 if this boot is running in recovery mode.
+		[ -f "$FLAG" ]
+		exit $?
+		;;
+
+	status)
+		echo "recovery_mode:      $(env_get recovery_mode)"
+		echo "recovery_bootcount: $(env_get recovery_bootcount)"
+		echo "threshold:          $(threshold)"
+		echo "this boot:          $([ -f "$FLAG" ] && echo RECOVERY || echo normal)"
+		echo "skip-list:          $(print_skip_list)"
+		;;
+
+	*)
+		echo "Usage: $0 {arm-check|mark-good|resume|skip-list|active|status}" >&2
+		exit 1
+		;;
+esac
+exit 0

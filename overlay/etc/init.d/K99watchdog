@@ -20,7 +20,10 @@ watchdog_enabled=$(get_wd_enabled)
 watchdog_timeout=$(get_wd_timeout)
 
 DAEMON="/usr/sbin/watchdog"
-DAEMON_ARGS="-T ${watchdog_timeout:-60} ${watchdog_device:-/dev/watchdog}"
+# -F keeps busybox watchdog in the foreground so start-stop-daemon -b owns the
+# backgrounding; without it the daemon double-forks and the pidfile records a
+# PID that has already exited (breaking stop/restart).
+DAEMON_ARGS="-F -T ${watchdog_timeout:-60} ${watchdog_device:-/dev/watchdog}"
 PIDFILE="/var/run/watchdog.pid"
 
 start_daemon() {
@@ -44,6 +47,14 @@ start() {
 	if [ "false" = "$watchdog_enabled" ]; then
 		echo -c 160 -e "$DAEMON is disabled" >&2
 		exit 1
+	fi
+
+	# Boot-loop failsafe: if this camera has rebooted too many times in a
+	# row, do NOT arm the hardware watchdog. Arming it would keep an
+	# unrecoverable loop going and force a physical power-cycle. Instead the
+	# camera stays up in recovery mode, reachable for remote repair.
+	if [ -x /usr/sbin/recovery-guard ] && ! /usr/sbin/recovery-guard arm-check; then
+		return 0
 	fi
 
 	# shellcheck disable=SC2086

@@ -1,22 +1,28 @@
 #!/bin/sh
 # provision-env - sync Thingino provisioning data between the overlay
 # (/etc) and the U-Boot environment, so a full firmware upgrade (which
-# wipes the overlay partition) can restore the device's identity.
+# wipes the overlay partition) can restore the device's identity and
+# its motor configuration.
 #
 #   provision-env snapshot   overlay -> U-Boot env. Called after the
 #                            captive portal or the web UI changes a
-#                            provisioned setting.
+#                            provisioned setting, and by `sysupgrade`
+#                            just before a full flash -- the latter is
+#                            what captures motor config, which is also
+#                            written out-of-band over SSH and so has no
+#                            web UI hook.
 #   provision-env restore    U-Boot env -> overlay. Called once, on the
 #                            first boot after an overlay wipe, by the
 #                            S02provision init script.
 #
 # Secrets are stored as hashes, never plaintext: the root password as
-# its /etc/shadow crypt hash, Wi-Fi as the derived PSK. The hash and the
-# SSH key are base64-wrapped so awkward characters never reach fw_setenv.
+# its /etc/shadow crypt hash, Wi-Fi as the derived PSK. The hash, the
+# SSH key and motors.json are base64-wrapped so awkward characters never
+# reach fw_setenv.
 #
 # Env keys written/read:
 #   prov_hostname  prov_timezone  prov_tzdata  prov_rootpw  prov_sshkey
-#   wlan_ssid      wlan_pass      wlan_ap
+#   prov_motors    wlan_ssid      wlan_pass    wlan_ap
 # (wlan_* are also consumed by S38wpa_supplicant for the Wi-Fi restore.)
 
 MARKER="/etc/.provisioned"
@@ -57,6 +63,15 @@ snapshot() {
 		grep -q '^[[:space:]]*mode=2' "$WPA_CONF" && wlan_ap_val="true"
 	fi
 
+	# Motor config: the whole /etc/motors.json, base64-wrapped. Stored
+	# verbatim and as a single unit so gpio_pan/gpio_tilt and the
+	# dragonfly_*_reversed direction markers always restore together --
+	# a partial set makes the provisioning agent re-reverse the motors.
+	# Absent on non-PTZ cameras; the key is then left empty (deleted).
+	motors_b64=""
+	[ -r /etc/motors.json ] && \
+		motors_b64=$(base64 < /etc/motors.json | tr -d '\n')
+
 	# Apply every key in a single batched fw_setenv (one flash write).
 	# A line with an empty value deletes that key from the environment.
 	tmp=$(mktemp) || return 1
@@ -69,6 +84,7 @@ snapshot() {
 		printf 'wlan_ssid %s\n'     "$wlan_ssid_val"
 		printf 'wlan_pass %s\n'     "$wlan_pass_val"
 		printf 'wlan_ap %s\n'       "$wlan_ap_val"
+		printf 'prov_motors %s\n'   "$motors_b64"
 	} >"$tmp"
 	fw_setenv --script "$tmp"
 	rc=$?
@@ -88,6 +104,7 @@ restore() {
 	tz_data=$(fw_printenv -n prov_tzdata 2>/dev/null)
 	rootpw_b64=$(fw_printenv -n prov_rootpw 2>/dev/null)
 	sshkey_b64=$(fw_printenv -n prov_sshkey 2>/dev/null)
+	motors_b64=$(fw_printenv -n prov_motors 2>/dev/null)
 
 	if [ -n "$hostname_val" ]; then
 		echo "$hostname_val" >/etc/hostname
@@ -114,6 +131,27 @@ restore() {
 		printf '%s' "$sshkey_b64" | base64 -d 2>/dev/null >/root/.ssh/authorized_keys
 		chmod 600 /root/.ssh/authorized_keys
 		echo "provision-env: restored SSH authorized_keys" >&2
+	fi
+
+	# Motor config: merge the saved /etc/motors.json back onto the
+	# firmware's default with jct, so a newer firmware's added keys
+	# survive while the saved gpio_*/dragonfly_*_reversed/pos_0/steps_*
+	# set is restored together. S02provision runs before S59motor, so the
+	# motor daemon reads the corrected file at its first start -- the
+	# drift is gone before anything consumes it, with no extra reboot.
+	if [ -n "$motors_b64" ] && have jct; then
+		mtmp=$(mktemp) || mtmp="/tmp/prov_motors.$$"
+		printf '%s' "$motors_b64" | base64 -d 2>/dev/null >"$mtmp"
+		if [ -s "$mtmp" ] && jct "$mtmp" get motors.steps_pan >/dev/null 2>&1; then
+			if jct /etc/motors.json import "$mtmp" >/dev/null 2>&1; then
+				echo "provision-env: restored motor config" >&2
+			else
+				echo "provision-env: motor config merge failed" >&2
+			fi
+		else
+			echo "provision-env: saved motor config invalid; skipped" >&2
+		fi
+		rm -f "$mtmp"
 	fi
 
 	# Wi-Fi (wlan_ssid/wlan_pass/wlan_ap) is restored separately by

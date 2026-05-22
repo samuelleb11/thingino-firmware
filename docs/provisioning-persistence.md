@@ -1,7 +1,8 @@
 # Provisioning Persistence Across Firmware Upgrades
 
 Keeping a configured camera's identity and credentials — Wi-Fi, hostname,
-timezone, root password, SSH key — across a full firmware upgrade.
+timezone, root password, SSH key — and its motor configuration across a
+full firmware upgrade.
 
 > This is distinct from `Provisioning-System.md`, which covers first-boot
 > auto-provisioning from a network provisioning server. This document is
@@ -21,6 +22,14 @@ hostname, timezone, the root password (`/etc/shadow`) and SSH
 captive-portal mode after every upgrade — effectively unrecoverable
 without physical access.
 
+A full upgrade also resets **motor configuration** (`/etc/motors.json`):
+pan/tilt GPIO assignment, homing position and direction-reversal markers
+revert to the camera profile's build defaults. A PTZ camera still boots,
+but comes back mis-homed or with reversed pan/tilt until the provisioning
+agent corrects it — and that correction needs a reboot of its own.
+Persisting `motors.json` removes the drift, so a configured camera needs
+only the single reboot the flash itself performs.
+
 ## Overview
 
 Persistence is achieved by three cooperating mechanisms:
@@ -28,7 +37,8 @@ Persistence is achieved by three cooperating mechanisms:
 1. **Environment preservation** — `sysupgrade` keeps the U-Boot
    environment partition byte-for-byte intact across the flash.
 2. **Capture** — when the camera is configured (captive portal or web
-   UI), the settings are mirrored into the U-Boot environment.
+   UI), the settings are mirrored into the U-Boot environment; motor
+   config is captured by `sysupgrade` itself, just before the flash.
 3. **Restore** — on the first boot after an upgrade, the settings are
    copied from the U-Boot environment back into the fresh overlay.
 
@@ -115,6 +125,19 @@ invoked from CGIs whose stdout becomes the HTTP response body.
 This keeps the U-Boot environment in step with the camera's current
 configuration, whether it was set at first boot or changed later.
 
+### Upgrade-time snapshot (motor config)
+
+Motor configuration has no web-UI capture hook. The provisioning agent
+(Dragonfly) writes `/etc/motors.json` over SSH with `jct`, bypassing the
+CGIs entirely, so a per-CGI hook would miss it.
+
+Instead, `sysupgrade` runs `provision-env snapshot` itself, immediately
+before it backs up the U-Boot environment partition (full upgrades only).
+This captures the *live* `/etc/motors.json` however it was set — web UI,
+Dragonfly, or a manual SSH edit — and the same call refreshes every other
+`prov_*` / `wlan_*` key from the current overlay as a side effect.
+`motors.json` is stored whole, base64-wrapped, in `prov_motors`.
+
 ## 3. Restoring settings on boot
 
 Restore is split between two init scripts because Wi-Fi recovery has to
@@ -143,6 +166,22 @@ environment back into the overlay. It is gated by an `/etc/.provisioned`
 marker so it runs **only once per overlay lifetime** — after a wipe, not
 on every boot — and so it never overrides a change the user makes later.
 
+### Motor config — `S02provision`
+
+The same `provision-env restore` call merges the saved `motors.json` back
+into the overlay: it base64-decodes `prov_motors` and uses `jct import`,
+so the saved values land on top of the new firmware's default file. A
+newer firmware's *added* keys survive, while the saved
+`gpio_pan` / `gpio_tilt` / `dragonfly_*_reversed` / `pos_0` /
+`steps_pan` / `steps_tilt` set is restored as one consistent unit —
+restoring only some of them would make the provisioning agent re-reverse
+the motors.
+
+`S02provision` (init stage 02) runs well before `S59motor` starts the
+motor daemon, so the daemon reads the corrected `motors.json` at its
+normal first start. The drift is gone before anything consumes the file,
+so no extra reboot is needed.
+
 ## U-Boot environment keys
 
 | Key             | Holds                              | Restored by         |
@@ -155,6 +194,7 @@ on every boot — and so it never overrides a change the user makes later.
 | `prov_tzdata`   | POSIX TZ string (`/etc/TZ`)        | `S02provision`      |
 | `prov_rootpw`   | root crypt hash, base64-wrapped    | `S02provision`      |
 | `prov_sshkey`   | `authorized_keys`, base64-wrapped  | `S02provision`      |
+| `prov_motors`   | `/etc/motors.json`, base64-wrapped | `S02provision`      |
 
 Because mechanism 1 preserves the whole partition, every key above
 survives an upgrade automatically — the per-key list matters only to the
@@ -212,6 +252,11 @@ cannot self-recover Wi-Fi after an upgrade either.
 - `provision-env restore` is fallback-only (gated by `/etc/.provisioned`).
   A configuration change made after an upgrade is captured normally by
   the capture hooks on the next change.
+- Motor config is merged with `jct import`, not copied wholesale, so a
+  new firmware's *added* `motors.json` keys take effect; only keys the
+  camera had previously set are carried across. Unlike the other
+  `prov_*` keys it is captured only at upgrade time, not on every
+  change — which is sufficient, since the snapshot reads the live file.
 
 ## Testing / verification
 
@@ -231,6 +276,9 @@ There is no automated test target; verify on hardware.
 5. After reboot, verify persistence:
    - the camera rejoined the configured Wi-Fi;
    - `hostname`, `cat /etc/timezone`, and the root password are retained;
+   - on a PTZ camera, `motors.json` kept its `gpio_*` /
+     `dragonfly_*_reversed` / `pos_0`, and the camera homes correctly
+     with no second reboot;
    - `/etc/.provisioned` exists.
 6. Negative check: on a camera with no prior configuration, confirm a
    full upgrade still boots and falls back to the captive portal cleanly.

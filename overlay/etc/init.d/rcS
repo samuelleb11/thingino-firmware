@@ -9,8 +9,23 @@ else
 	echo -c 240 -e "- Cannot find $TZCODE_FILE"
 fi
 
+# Recovery mode (set by recovery-guard via K99watchdog when a boot loop is
+# detected): bring up the lightest possible system - skip heavy services so
+# the camera always comes up on the network and reachable for remote repair.
+RECOVERY_SKIP=""
+if [ -f /run/recovery_mode ]; then
+	RECOVERY_SKIP=" $(/usr/sbin/recovery-guard skip-list 2>/dev/null) "
+	echo -c 196 -e "\n*** RECOVERY MODE - skipping heavy services:${RECOVERY_SKIP}***\n"
+fi
+
 # Run init scripts in numerical order
 for i in $(find /etc/init.d/ -name "S*" -executable | sort -n); do
+	case "$RECOVERY_SKIP" in
+		*" ${i##*/} "*)
+			echo -c 208 "recovery: skipping ${i##*/}"
+			continue
+			;;
+	esac
 	/bin/sh -c "$i start"
 done
 

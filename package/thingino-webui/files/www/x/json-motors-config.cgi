@@ -78,6 +78,17 @@ motors_get_field() {
 	jct "$motors_config_file" get "$motors_domain.$1" 2>/dev/null
 }
 
+# Apply the freshly saved config to the running motors. The reload
+# (motor module reload + re-home) takes several seconds, so it is
+# launched detached in the background and the HTTP response returns at
+# once; its stdio is redirected so it cannot corrupt the response body.
+# S59motor reload re-reads this very motors.json, so the applied change
+# also survives a reboot or a firmware upgrade.
+apply_motors_config() {
+	[ -x /etc/init.d/S59motor ] || return 0
+	/etc/init.d/S59motor reload >/dev/null 2>&1 &
+}
+
 ensure_config_file() {
 	[ -f "$motors_config_file" ] && return
 	umask_old=$(umask)
@@ -183,6 +194,8 @@ handle_post() {
 	else
 		motors_set_value pos_0 ""
 	fi
+
+	apply_motors_config
 
 	respond_with_config
 }

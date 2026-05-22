@@ -323,6 +323,26 @@ backup_env_partition() {
 	echo "Saved $size bytes of U-Boot environment to $workdir/env.backup"
 }
 
+# Full-upgrade only: a full flash wipes the overlay partition, so the
+# device's provisioning data -- hostname, Wi-Fi, timezone, root password,
+# SSH key and motor config -- would be lost. provision-env mirrors it
+# into the U-Boot environment now; backup_env_partition() then preserves
+# that environment across the flash, and `provision-env restore` re-applies
+# it on the first boot. Non-fatal: a failed snapshot just means the camera
+# boots on firmware defaults and is re-provisioned the old way.
+snapshot_provisioning_env() {
+	if [ ! -x /usr/sbin/provision-env ]; then
+		echo "provision-env not present; skipping provisioning snapshot."
+		return 0
+	fi
+	echo_c 112 "\nSnapshot provisioning data into U-Boot environment"
+	if /usr/sbin/provision-env snapshot; then
+		echo "Provisioning data snapshotted."
+	else
+		echo_c 208 "provision-env snapshot failed; config reverts to firmware defaults."
+	fi
+}
+
 show_help() {
 	echo -e "Usage: $0 [-x] [-f|-p|<file>|<URL>]
 Where:
@@ -550,9 +570,12 @@ clone_app /bin/busybox
 clone_app /sbin/$stage2app
 for a in $bbapplets; do expand_bb $a; done
 
-# Full-upgrade only: a full ("all") flash rewrites the env partition,
-# so back it up now -- stage 2 writes it straight back after the flash.
+# Full-upgrade only: a full ("all") flash wipes both the overlay and the
+# env partition. Snapshot provisioning data into the env first, then back
+# the env up byte-for-byte -- stage 2 writes it straight back after the
+# flash and provision-env restores it on the first boot.
 if [ "$mtd_dev" = "$(full_upgrade_partition_name)" ]; then
+	snapshot_provisioning_env
 	backup_env_partition
 fi
 
